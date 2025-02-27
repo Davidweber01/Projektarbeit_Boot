@@ -40,7 +40,7 @@ def parse_nmea_gnrmc(nmea_string):
     parts = nmea_string.strip().split(',')
     
     # Check if this is a valid GNRMC sentence
-    if not parts[0].endswith('RMC') or len(parts) < 10:
+    if not parts[0].endswith('RMC'):
         raise ValueError(f"Invalid GNRMC format: {nmea_string}")
     
     # Check validity flag
@@ -197,6 +197,7 @@ def test_with_examples():
     Test the parsing functionality with the provided examples
     """
     examples = [
+        "QOdA/CeAAQDP8vmA"
         "24474E524D432C3137333030362E30302C412C343734312E31323437342C4E2C30303930382E37383230302C452C302E3033362C2C3235303232352C2C2C4136",
         "24474E524D432C3137333030372E30302C412C343734312E31323437342C4E2C30303930382E37383230302C452C302E3036332C2C3235303232352C2C2C4136",
         "24474E524D432C3137333030382E30302C412C343734312E31323437362C4E2C30303930382E37383139392C452C302E3130332C2C3235303232352C2C2C4136",
