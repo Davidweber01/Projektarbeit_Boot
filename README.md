@@ -25,4 +25,8 @@ Das Gehäuse kann an der HTWG 3D gedruckt werden, dafür benötigen wir ein CAD-
 
 _Als kleine Nebenaufgabe/Nebeneigenschaft wäre ein kleines Solarpanel am Gehäuse zu montieren, damit das Device für eine Weile autar laufen könnte (natürlich wasserdicht)._
 
+## 5. End device Info TTN
+AppEUI: 583875E9A9FE9FA9
+DevEUI: 70B3D57ED8003D8F
 
+Device Address: 27FC40EE
