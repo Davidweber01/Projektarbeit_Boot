@@ -33,11 +33,22 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define BUFFER_SIZE 		128
-#define LoRa_BUFFER_SIZE 	4
-#define GPS_BUFFER_SIZE		16
-//#define GPS_BUFFER_SIZE 256
-#define SEARCH_STRING "$GNRMC"  // Die zu suchende Zeichenkette
+#define BUFFER_SIZE 		83
+#define LoRa_BUFFER_SIZE 	64
+
+#define WAKE 1					//States Definieren
+#define SEND 2
+#define JOIN 3
+#define SLEEP 4
+#define GPS 5
+#define FULL_RESET 6
+
+#define OK_ANSWER 1				//States für erwartete Antwort der LoRa Antenne definieren
+#define JOIN_ANSWER 2
+#define SEND_ANSWER 3
+
+
+#define SEARCH_STRING "$GNRMC"  // Die zu suchende Zeichenkette in der GPS Nachricht
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -46,52 +57,33 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+RTC_HandleTypeDef hrtc;
+
+TIM_HandleTypeDef htim5;
+
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart3;
 DMA_HandleTypeDef hdma_usart3_rx;
 
 /* USER CODE BEGIN PV */
-char msg_tx1[] = "AT+DEUI=70:B3:D5:7E:D8:00:3D:8F\r";
-char msg_tx2[] = "AT+APPEUI=58:38:75:E9:A9:FE:9F:A9\r";
-char msg_tx3[] = "AT+NWKKEY=D4:67:24:93:1B:8C:89:BC:69:41:FC:EB:17:21:66:1F\r";
-char msg_tx4[] = "AT+APPKEY=D4:67:24:93:1B:8C:89:BC:69:41:FC:EB:17:21:66:1F\r";
-char msg_tx5[] = "AT+JOIN=1\r";
-char msg_tx[] = "AT\r";
-uint8_t rxBuffer[LoRa_BUFFER_SIZE];
+char rxBuffer[LoRa_BUFFER_SIZE]; 		//Puffer für die LoRa-Antwort
 uint8_t rxBuf;
 uint8_t gps_index = 0;
-uint8_t receiving = 0;
-volatile uint8_t receivedFlag = 0;
-volatile uint8_t transferFlag = 0;
-volatile uint8_t state = 0;
-
-
-
-
+uint8_t recieving = 0;
+uint8_t answerRecieved = 0;				//Umschaltvariable für Antwort der LoRa-Antenne
+uint8_t state = WAKE;						//Zustandsvariable
+uint8_t stateAnswer = 0;				//Zustandsvariable für die erwartete LoRa Antwort
+uint8_t rxByte;							//Variable für aktuell eingelesenes Byte auf dem UART
+uint16_t rx_index = 0;					//Variable für den aktuellen Index im Puffer
 
 uint8_t message_buffer[BUFFER_SIZE];  // Puffer für die Nachricht zwischen "$GNRMC" und "*"
 uint16_t buffer_index = 0;  // Index, um den aktuellen Pufferort zu verfolgen
 uint16_t message_index = 0;  // Index für den Nachrichtenspeicher
+uint16_t GpsSize = 0;	//Variable für die größe des GPS Strings
 uint8_t rx_char;  // Einzelnes Zeichen für den Empfang
 uint8_t checksum_phase = 0;  // Speichert, ob wir gerade die Prüfsumme empfangen
-uint8_t gps_ack_buffer[GPS_BUFFER_SIZE];
-uint8_t gps_config_stat = 0;
-uint8_t wait_for_gps_ack = 0;
-uint8_t send_ubx_state = 1;
-
-enum config_gps
-{
-	ACTIVATE_RMC,
-	DEACTIVATE_GGA,
-	DEACTIVATE_GLL,
-	DEACTIVATE_GSA,
-	DEACTIVATE_GSV,
-	DEACTIVATE_VTG,
-	GPS_CONFIGURED
-};
-static enum config_gps config_gps_state;
-
-volatile uint8_t gps_config_state = 0;
+uint8_t GpsActive = 0;		//Umschaltvariable für validität der GPS-Daten
+volatile char LoraPayload[sizeof(message_buffer) * 2 + 1];	//Hilfspuffer für die LoRa Payload
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -100,9 +92,11 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_USART3_UART_Init(void);
+static void MX_TIM5_Init(void);
+static void MX_RTC_Init(void);
 /* USER CODE BEGIN PFP */
 void sendCommandAndWaitForOK(const char *command);
-uint8_t checkResponse(const char* strCheck);
+uint8_t checkResponse(char *rxBuffer, const char* strCheck);
 void parse_gnrmc(char *data);
 void send_ubx_message(UART_HandleTypeDef *huart, uint8_t *msg, uint16_t len);
 void Process_GNRMC_Data(uint8_t* data);
@@ -111,6 +105,7 @@ void Store_GPS_Data(void);
 int GPS_Check_ACK(uint8_t *buffer, int size);
 void Config_GPS_Modul_Iteration(uint8_t state);
 void convertToHex(const char *input, char *output);
+void processLoraMessage(char *rxBuffer);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -149,11 +144,19 @@ int main(void)
   MX_DMA_Init();
   MX_USART1_UART_Init();
   MX_USART3_UART_Init();
+  MX_TIM5_Init();
+  MX_RTC_Init();
   /* USER CODE BEGIN 2 */
 /* ============== Activate Power Supply for external Components ===========*/
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET);
+//  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET);
 /* ========================================================================*/
-  uint8_t atCommand6[] = "AT+JOIN=1\r";
+  if (__HAL_PWR_GET_FLAG(PWR_FLAG_SB) != RESET)		//Mit Standby-Flag prüfen ob Programm aus standby erwacht ist
+  {
+      __HAL_PWR_CLEAR_FLAG(PWR_FLAG_SB);  // Standby-Flag löschen
+      HAL_RTCEx_DeactivateWakeUpTimer(&hrtc);  // RTC Wakeup deaktivieren
+      state = WAKE;							//In Zustand "WAKE" gehen
+  }
+
 
 
   /* USER CODE END 2 */
@@ -162,74 +165,74 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  if(state == 7)
-	    {
-		  HAL_UART_Receive_IT(&huart1, rxBuffer, sizeof(rxBuffer));
-	  	  HAL_UART_Transmit(&huart1, atCommand6, sizeof(atCommand6) - 1, 10);
-	  	  //HAL_Delay(100);
-	  	  //HAL_UART_Receive_IT(&huart1, rxBuffer, sizeof(rxBuffer));
-	  	  //HAL_UART_Receive(&huart1, rxBuffer, sizeof(rxBuffer), 4000);
-//
-	  	  //HAL_Delay(500);
-		  HAL_UART_Receive_IT(&huart1, rxBuffer, sizeof(rxBuffer));
 
-	  	  while(state)
-	  	  {
-		  	  //HAL_UART_Receive_IT(&huart1, rxBuffer, sizeof(rxBuffer));
-	  	  }
-	    }
-//	  switch (state)
-//	  {
-//	  case 0:
-//
-//		  break;
-//	  case 1:
-//		  uint8_t atCommand1[] = "AT+SEND=1:1:ABCD\r";
-//		  HAL_UART_Transmit(&huart1, atCommand1, sizeof(atCommand1) - 1, 100);
-//		  HAL_UART_Receive_IT(&huart1, rxBuffer, sizeof(rxBuffer));
-//		  HAL_Delay(500);
-//		  break;
-//	  case 2:
-//		  uint8_t atCommand2[] = "AT+DEUI=70:B3:D5:7E:D8:00:3D:8F\r";
-//		  HAL_UART_Transmit(&huart1, atCommand2, sizeof(atCommand2) - 1, HAL_MAX_DELAY);
-//		  HAL_UART_Receive_IT(&huart1, rxBuffer, sizeof(rxBuffer));
-//		  HAL_Delay(500);
-//		  break;
-//	  case 3:
-//		  uint8_t atCommand3[] = "AT+APPEUI=58:38:75:E9:A9:FE:9F:A9\r";
-//		  HAL_UART_Transmit(&huart1, atCommand3, sizeof(atCommand3) - 1, HAL_MAX_DELAY);
-//		  HAL_UART_Receive_IT(&huart1, rxBuffer, sizeof(rxBuffer));
-//		  HAL_Delay(500);
-//		  break;
-//	  case 4:
-//		  uint8_t atCommand4[] = "AT+NWKKEY=D4:67:24:93:1B:8C:89:BC:69:41:FC:EB:17:21:66:1F\r";
-//		  HAL_UART_Transmit(&huart1, atCommand4, sizeof(atCommand4) - 1, HAL_MAX_DELAY);
-//		  HAL_UART_Receive_IT(&huart1, rxBuffer, sizeof(rxBuffer));
-//		  HAL_Delay(500);
-//		  break;
-//	  case 5:
-//		  uint8_t atCommand5[] = "AT+APPKEY=D4:67:24:93:1B:8C:89:BC:69:41:FC:EB:17:21:66:1F\r";
-//		  HAL_UART_Transmit(&huart1, atCommand5, sizeof(atCommand5) - 1, HAL_MAX_DELAY);
-//		  HAL_UART_Receive_IT(&huart1, rxBuffer, sizeof(rxBuffer));
-//		  HAL_Delay(500);
-//		  break;
-//	  case 6:
-//		  uint8_t atCommand6[] = "AT+JOIN=1\r";
-//		  HAL_UART_Transmit(&huart1, atCommand6, sizeof(atCommand6) - 1, HAL_MAX_DELAY);
-//		  HAL_UART_Receive_IT(&huart1, rxBuffer, sizeof(rxBuffer));
-//		  HAL_Delay(500);
-//		  break;
-//	  case 7:
-//		  Config_GPS_Modul();
-//		  HAL_UART_Receive_IT(&huart3, &rx_char, 1);
-////		  break;
-//
-//	  }
+	  switch (state)
+	  {
+	  case 0:
+		  state = WAKE;
+		  break;
+	  case WAKE:
+		  HAL_TIM_Base_Start_IT(&htim5);			//Timer für Errortimeout im Interruptmodus starten
+		  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET);	//Stromversorgung der Antennen einschalten
+		  HAL_Delay(5000);
+		  Config_GPS_Modul();						//GPS-Modul konfigurieren
+		  HAL_UART_Receive_IT(&huart3, &rx_char, 1);	//Auf UART3(GPS) zuhören im Interruptmodus
+		  answerRecieved = 0;						//Antwortflag reseten
+		  state = GPS;								//In GPS Zustand wechseln
+		  break;
+	  case SEND:
+		  if(!answerRecieved){				//Prüfen ob bereits Antwort empfangen wurde
+		  uint8_t atCommand1[sizeof(LoraPayload) + 20];		//Command Array definieren
+		  snprintf(atCommand1, sizeof(atCommand1), "AT+SEND=1:1:%s\r\n", LoraPayload); //Command Array mit Send-Befehl und Payload füllen
+		  memset(LoraPayload, 0, sizeof(LoraPayload));	//Hilfspuffer für Payload reseten
+		  stateAnswer = SEND_ANSWER;					//Antwortszustand für Antworten vom AT+SEND command setzen
+		  HAL_Delay(1000);
+		  HAL_UART_Receive_IT(&huart1, &rxByte, 1);		//An UART1 (LoRa) zuhören im Interruptmodus starten
+		  HAL_UART_Transmit(&huart1, atCommand1, 14 + GpsSize * 2 - 1,  HAL_MAX_DELAY);		//Command Array an UART1 (LoRa) senden
+		  HAL_Delay(500);
+		  }
+		  break;
+	  case JOIN:
+		  HAL_UART_Receive_IT(&huart1, &rxByte, 1);		//An UART1 (LoRa) zuhören im Interruptmodus starten
+		  HAL_UART_Receive_IT(&huart3, &rx_char, 1);	//An UART3 (GPS) zuhören im Interruptmodus starten
+		  uint8_t atCommand6[] = "AT+JOIN=1\r\n";		//Command array initialisieren
+		  if(!answerRecieved){							//Prüfen ob bereits eine Antwort eines vorherigen durchlaufs empfangen wurde um nicht durchgehend wieder zu senden
+		  HAL_Delay(1000);
+		  stateAnswer = JOIN_ANSWER;					//Antwortszustand für Antworten vom AT+JOIN Command setzen
+		  HAL_UART_Receive_IT(&huart1, &rxByte, 1);			//An UART1 (LoRa) zuhören im Interruptmodus starten
+		  HAL_UART_Transmit(&huart1, atCommand6, sizeof(atCommand6) - 1, HAL_MAX_DELAY);	//Command Array an UART1 (LoRa) senden
+		  HAL_Delay(500);
+		  }
+		  break;
+	  case SLEEP:
+		  HAL_TIM_Base_Stop(&htim5);	//Timer für Errortimeout stopen
+		  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET);	//Stromversorgung der Antennen abschalten
+		  HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, 61439, RTC_WAKEUPCLOCK_RTCCLK_DIV16);	//RTC Wakeuptimer starten
+		  HAL_PWR_EnterSTANDBYMode();				    // Standby-Modus aktivieren
+		  break;
+	  case GPS:
+		  HAL_UART_Receive_IT(&huart3, &rx_char, 1);		//An UART3 (GPS) zuhören im Interruptmodus starten
+		  if(GpsActive){			//Prüfen ob valide GPS-Daten empfangen werden
+			  state = JOIN;			//Zustand auf JOIN setzen
+		  }
+		  break;
+	  case FULL_RESET:
+		  HAL_TIM_Base_Stop(&htim5);		//Timer für Errortimeout stopen
+		  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET);	//Stromversorgung der Antennen abschalten
+		  answerRecieved = 0;		//Antwortflag reseten
+		  GpsActive = 0;			//GPSvalid flag reseten
+		  HAL_Delay(5000);
+		  state = WAKE;				//Zustand auf WAKE setzen
+		  break;
+	  }
 
+	  HAL_Delay(500);
+	  HAL_UART_Receive_IT(&huart1, &rxByte, 1);
+  }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-  }
+
   /* USER CODE END 3 */
 }
 
@@ -249,9 +252,10 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_LSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
   RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV4;
@@ -277,6 +281,95 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief RTC Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_RTC_Init(void)
+{
+
+  /* USER CODE BEGIN RTC_Init 0 */
+
+  /* USER CODE END RTC_Init 0 */
+
+  /* USER CODE BEGIN RTC_Init 1 */
+
+  /* USER CODE END RTC_Init 1 */
+
+  /** Initialize RTC Only
+  */
+  hrtc.Instance = RTC;
+  hrtc.Init.HourFormat = RTC_HOURFORMAT_24;
+  hrtc.Init.AsynchPrediv = 127;
+  hrtc.Init.SynchPrediv = 255;
+  hrtc.Init.OutPut = RTC_OUTPUT_DISABLE;
+  hrtc.Init.OutPutRemap = RTC_OUTPUT_REMAP_NONE;
+  hrtc.Init.OutPutPolarity = RTC_OUTPUT_POLARITY_HIGH;
+  hrtc.Init.OutPutType = RTC_OUTPUT_TYPE_OPENDRAIN;
+  hrtc.Init.OutPutPullUp = RTC_OUTPUT_PULLUP_NONE;
+  if (HAL_RTC_Init(&hrtc) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Enable the WakeUp
+  */
+  if (HAL_RTCEx_SetWakeUpTimer_IT(&hrtc, 61439, RTC_WAKEUPCLOCK_RTCCLK_DIV16) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN RTC_Init 2 */
+
+  /* USER CODE END RTC_Init 2 */
+
+}
+
+/**
+  * @brief TIM5 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM5_Init(void)
+{
+
+  /* USER CODE BEGIN TIM5_Init 0 */
+
+  /* USER CODE END TIM5_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM5_Init 1 */
+
+  /* USER CODE END TIM5_Init 1 */
+  htim5.Instance = TIM5;
+  htim5.Init.Prescaler = 16999;
+  htim5.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim5.Init.Period = 1199999;
+  htim5.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim5.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim5) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim5, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim5, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM5_Init 2 */
+
+  /* USER CODE END TIM5_Init 2 */
+
 }
 
 /**
@@ -437,94 +530,84 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
-void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)		//ISR der UARTS
 {
-	if(GPIO_Pin == /*GPIO_PIN_13*/GPIO_PIN_5)
-	{
-	    	    state = 7;
-	}
-}
-
-// USART1: LoRa-Modul
-void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
-{
-	if(huart->Instance == USART1)
-	{
-
-	}
-}
-
-// USART3: GPS-Modul
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
-{
-    if (huart->Instance == USART3)
+    if (huart->Instance == USART3)		//Prüfen ob UART 3 (GPS) ausgelößt wurde
     {
-//    	printf("State: %d\n", config_gps_state);
-//    	Config_GPS_Modul_Iteration(config_gps_state);
-
-		Store_GPS_Data();
-        HAL_UART_Receive_IT(huart, &rx_char, 1);
+		Store_GPS_Data();				//GPS Daten verarbeiten
+        HAL_UART_Receive_IT(&huart3, &rx_char, 1);
     }
 
-    if (huart->Instance == USART1)
+    if (huart->Instance == USART1)		//Prüfen ob UART 1 (LoRa) ausgelößt wurde
     {
-		//memset(rxBuffer, 0, sizeof(rxBuffer));
+    	answerRecieved = 1;				//Antwortflag setzen
 
-//    	if(checkResponse("OK") == 1)
-//    	{
-//    		state = 0;
-//    	}
-//    	else
-//    	{
-//    		state = 0;
-//    	}
-    }
+			if (rxByte == '\n')			//Prüfen ob das aktuelle Byte "\n" ist
+			{
+
+				if (rx_index > 0 && rxBuffer[rx_index - 1] == '\r')		//Prüfen ob Index größer 0 und ob das verherige Byte "\r" war
+				{
+
+					if (rx_index > 7)		//Prüfen ob mindestens 7 Bytes empfangen wurden um "OK" antworten rauszufiltern
+					{
+
+						rxBuffer[rx_index - 1] = '\0';		//Puffer mit \0 abschließen
+						answerRecieved = 0;					//Antwortflag reseten
+						processLoraMessage(rxBuffer);		//Empfangene Nachricht verarbeiten
+
+
+					}
+
+					rx_index = 0;	//Index reseten
+				}
+				else
+				{
+
+					if (rx_index < LoRa_BUFFER_SIZE - 1)	//Prüfen ob Index kleiner als Puffergröße ist
+					{
+						rxBuffer[rx_index++] = rxByte;		//Aktuelles Byte an stelle von Index in Puffer schreiben und Index inkrementieren
+					}
+					else
+					{
+						answerRecieved = 0;					//Antwortflag reseten
+						rx_index = 0;						//Index reseten
+					}
+				}
+			}
+			else
+			{
+
+				if (rx_index < LoRa_BUFFER_SIZE - 1)	//Prüfen ob Index kleiner als Puffergröße ist
+				{
+					rxBuffer[rx_index++] = rxByte;		//Aktuelles Byte an stelle von Index in Puffer schreiben und Index inkrementieren
+				}
+				else
+				{
+					answerRecieved = 0;					//Antwortflag reseten
+					rx_index = 0;						//Index reseten
+				}
+			}
+
+			HAL_UART_Receive_IT(&huart1, &rxByte, 1);
+
+		}
+
 }
 
-
-
-void parse_gnrmc(char *data)
+uint8_t checkResponse(char *rxBuffer, const char* strCheck)
 {
-    char time[10], status[2], latitude[10], lat_dir[2], longitude[11], lon_dir[2], speed[10], date[7];
-
-    sscanf(data, "$GNRMC,%9[^,],%1[^,],%9[^,],%1[^,],%10[^,],%1[^,],%9[^,],,,%6[^,],",
-           time, status, latitude, lat_dir, longitude, lon_dir, speed, date);
-
-    printf("Time: %s\n", time);
-    printf("Status: %s\n", status);
-    printf("Latitude: %s %s\n", latitude, lat_dir);
-    printf("Longitude: %s %s\n", longitude, lon_dir);
-    printf("Speed: %s\n", speed);
-    printf("Date: %s\n", date);
-}
-
-
-void Process_GNRMC_Data(uint8_t* data)
-{
-
-    if (strncmp((char*)data, "$GNRMC", 6) == 0)
+    if (strstr(rxBuffer, strCheck) != NULL)		//Prüfen ob strCheck in rxBuffer enthalten ist
     {
-
-        printf("GNRMC Data: %s\n", data);
-    }
-    else
-    {
-
-    }
-}
-
-uint8_t checkResponse(const char* strCheck)
-{
-    if (strstr((char *)rxBuffer, strCheck) != NULL)
-    {
+        memset(rxBuffer, 0, BUFFER_SIZE);		//rxBuffer reseten
         return 1;
-        memset(rxBuffer, 0, BUFFER_SIZE);
     }
     return 0;
 }
 
 void Config_GPS_Modul(void)
 {
+
+	//UBX Commands definieren
 	uint8_t ubx_cfg_nmea_RMC[] = {0xB5, 0x62, 0x06, 0x01, 0x08, 0x00, 0xF0, 0x04, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x04, 0x44}; // activate
 	uint8_t ubx_cfg_nmea_GGA[] = {0xB5, 0x62, 0x06, 0x01, 0x08, 0x00, 0xF0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x23}; //deactivate
 	uint8_t ubx_cfg_nmea_GLL[] = {0xB5, 0x62, 0x06, 0x01, 0x08, 0x00, 0xF0, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2A}; //deactivate
@@ -532,7 +615,8 @@ void Config_GPS_Modul(void)
 	uint8_t ubx_cfg_nmea_GSV[] = {0xB5, 0x62, 0x06, 0x01, 0x08, 0x00, 0xF0, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x38}; //deactivate
 	uint8_t ubx_cfg_nmea_VTG[] = {0xB5, 0x62, 0x06, 0x01, 0x08, 0x00, 0xF0, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x46}; //deactivate
 
-	//send_ubx_state = 1;
+
+	//UBX Commands an GPS Senden
 	send_ubx_message(&huart3, ubx_cfg_nmea_RMC, sizeof(ubx_cfg_nmea_RMC));
 	send_ubx_message(&huart3, ubx_cfg_nmea_GGA, sizeof(ubx_cfg_nmea_GGA));
 	send_ubx_message(&huart3, ubx_cfg_nmea_GLL, sizeof(ubx_cfg_nmea_GLL));
@@ -540,180 +624,130 @@ void Config_GPS_Modul(void)
 	send_ubx_message(&huart3, ubx_cfg_nmea_GSV, sizeof(ubx_cfg_nmea_GSV));
 	send_ubx_message(&huart3, ubx_cfg_nmea_VTG, sizeof(ubx_cfg_nmea_VTG));
 
-
-//	while(send_ubx_state)
-//	{
-//		switch(config_gps_state)
-//			{
-//			case ACTIVATE_RMC:
-//				send_ubx_message(&huart3, ubx_cfg_nmea_RMC, sizeof(ubx_cfg_nmea_RMC));
-//				break;
-//			case DEACTIVATE_GGA:
-//				send_ubx_message(&huart3, ubx_cfg_nmea_GGA, sizeof(ubx_cfg_nmea_GGA));
-//				break;
-//			case DEACTIVATE_GLL:
-//				send_ubx_message(&huart3, ubx_cfg_nmea_GLL, sizeof(ubx_cfg_nmea_GLL));
-//				break;
-//			case DEACTIVATE_GSA:
-//				send_ubx_message(&huart3, ubx_cfg_nmea_GSA, sizeof(ubx_cfg_nmea_GSA));
-//				break;
-//			case DEACTIVATE_GSV:
-//				send_ubx_message(&huart3, ubx_cfg_nmea_GSV, sizeof(ubx_cfg_nmea_GSV));
-//				break;
-//			case DEACTIVATE_VTG:
-//				send_ubx_message(&huart3, ubx_cfg_nmea_VTG, sizeof(ubx_cfg_nmea_VTG));
-//				break;
-//			case GPS_CONFIGURED:
-//				printf("GPS already configured! \n");
-//				send_ubx_state = 0;
-//				break;
-//			default:
-//				break;
-//
-//			}
-//			//HAL_Delay(50);
-//
-//	}
-
-
-}
-
-void Config_GPS_Modul_Iteration(uint8_t state)
-{
-	switch (state)
-	    	{
-	    	case ACTIVATE_RMC:
-	    		if(GPS_Check_ACK(gps_ack_buffer, sizeof(gps_ack_buffer)) == 1)
-	    		{
-
-	    			printf("ACK erhalten RMC! \n");
-	    			memset(gps_ack_buffer, 0, sizeof(gps_ack_buffer));
-	    			config_gps_state++;
-	    		}
-	    		break;
-	    	case DEACTIVATE_GGA:
-	    		if(GPS_Check_ACK(gps_ack_buffer, sizeof(gps_ack_buffer)) == 1)
-				{
-	    			config_gps_state++;
-					printf("ACK erhalten GGA! \n");
-					memset(gps_ack_buffer, 0, sizeof(gps_ack_buffer));
-				}
-	    		break;
-	    	case DEACTIVATE_GLL:
-	    		if(GPS_Check_ACK(gps_ack_buffer, sizeof(gps_ack_buffer)) == 1)
-				{
-	    			config_gps_state++;
-					printf("ACK erhalten GLL! \n");
-					memset(gps_ack_buffer, 0, sizeof(gps_ack_buffer));
-				}
-	    		break;
-	    	case DEACTIVATE_GSA:
-	    		if(GPS_Check_ACK(gps_ack_buffer, sizeof(gps_ack_buffer)) == 1)
-				{
-	    			config_gps_state++;
-					printf("ACK erhalten GSA! \n");
-					memset(gps_ack_buffer, 0, sizeof(gps_ack_buffer));
-				}
-	    		break;
-	    	case DEACTIVATE_GSV:
-	    		if(GPS_Check_ACK(gps_ack_buffer, sizeof(gps_ack_buffer)) == 1)
-				{
-	    			config_gps_state++;
-					printf("ACK erhalten GSV! \n");
-					memset(gps_ack_buffer, 0, sizeof(gps_ack_buffer));
-				}
-	    		break;
-	    	case DEACTIVATE_VTG:
-	    		if(GPS_Check_ACK(gps_ack_buffer, sizeof(gps_ack_buffer)) == 1)
-				{
-	    			config_gps_state++;
-					printf("ACK erhalten VTG! \n");
-					memset(gps_ack_buffer, 0, sizeof(gps_ack_buffer));
-				}
-	    		break;
-	    	case 6:
-	    		printf("GPS already configured! \n");
-	    		break;
-	    	default:
-	    		break;
-
-
-	    	}
-
-
 }
 
 void send_ubx_message(UART_HandleTypeDef *huart, uint8_t *msg, uint16_t len)
 {
-	HAL_UART_Transmit(huart, msg, len, 200);
-	//HAL_UART_Receive_IT(&huart3, gps_ack_buffer, sizeof(gps_ack_buffer));
+	HAL_UART_Transmit(huart, msg, len, 200);	//msg an huart senden
 }
+
 void Store_GPS_Data(void)
 {
-	 if (receiving)
+	if (recieving)		//Prüfen ob empfangen wird
 	{
-		if (rx_char == '*')
+
+		if (rx_char == '*')		//Prüfen ob aktueller Char '*' ist (* schließt RMC Nachricht ab)
 		{
 
-			checksum_phase = 1;
+			checksum_phase = 1;		//Checksum_phase setzen
 		}
-		else if (checksum_phase && message_index < BUFFER_SIZE - 1)
+		else if (checksum_phase && message_index < BUFFER_SIZE - 1)		//Prüfen ob checksum_phase gesetzt ist und ob der Index kleiner als die Puffergröße ist
 		{
 
-			message_buffer[message_index++] = rx_char;
+			message_buffer[message_index++] = rx_char;	//Aktuellen Char an stelle von Index in Puffer schreiben und Index inkrementieren
 
-			if (message_index >= 3 && checksum_phase)
+			if (message_index >= 3 && checksum_phase)		//Prüfen ob index größergleich 3 und checksum_phase gesetzt ist
 			{
-				char hexOutput[sizeof(message_buffer) * 2 + 1];
+				char hexOutput[sizeof(message_buffer) * 2 + 1];		//Puffer für Hex_daten initialisieren
 
-				message_buffer[message_index] = '\0';
-				convertToHex((char *)message_buffer, hexOutput);
+				message_buffer[message_index] = '\0';		//Puffer mit '\0' abschließen
+				if(message_buffer[17] == 'A'){				//Prüfen ob aktueller Buffer valide ist
+				convertToHex((char *)message_buffer, hexOutput);	//Puffer zu HEX konvertieren
 				printf("Empfangene Nachricht: %s\n", message_buffer);
 				printf("Empfangene Nachricht in HEX: %s\n",  hexOutput);
-				memset(message_buffer, 0, BUFFER_SIZE);
-				message_index = 0;
-				receiving = 0;
-				checksum_phase = 0;
+				GpsSize = message_index;		//Aktuellen index in GpsSize speichern
+				GpsActive = 1;					//GpsActive setzten um empfang valider GPS Daten zu bestätigen
+				strcpy(LoraPayload, hexOutput);	//hexOutput in Hilfspuffer LoraPayload kopieren
+				}
+
+				memset(message_buffer, 0, BUFFER_SIZE);		//Puffer reseten
+				memset(hexOutput, 0, sizeof(hexOutput));	//Hex-Puffer reseten
+				message_index = 0;							//INdex reseten
+				recieving = 0;								//recieve Flag reseten
+				checksum_phase = 0;							//Checksum_phase reseten
 			}
-		} else if (message_index < BUFFER_SIZE - 1)
+		} else if (message_index < BUFFER_SIZE - 1)			//Prüfen ob noch platz im Puffer ist
 		{
 
-			message_buffer[message_index++] = rx_char;
+			message_buffer[message_index++] = rx_char;		//Aktuellen Char an stelle von Index in Puffer schreiben und Index inkrementieren
 		}
 	}
-	else if (rx_char == '$')
+	else if (rx_char == '$')			//Prüfen ob startzeichen '$' empfangen wurde
 	{
 
-		message_index = 0;
-		receiving = 1;
+		message_index = 0;		//Index reseten
+		recieving = 1;			//Recieve flag setzen
 		checksum_phase = 0;
-		memset(message_buffer, 0, BUFFER_SIZE);
-		message_buffer[message_index++] = rx_char;
+		memset(message_buffer, 0, BUFFER_SIZE);	//Puffer reseten
+		message_buffer[message_index++] = rx_char;		//Aktuellen Char an stelle von Index in Puffer schreiben und Index inkrementieren
 	}
-}
-int GPS_Check_ACK(uint8_t *buffer, int size)
-{
-	buffer[size] = '\0';
-
-	for (int i = 0; i < size - 2; i++)
-	{
-		if (buffer[i] == 0xB5 && buffer[i + 1] == 0x62)
-		{
-			return 1;
-		}
-	}
-	return 0;
-
 }
 
 void convertToHex(const char *input, char *output)
 {
     while (*input) {
-        sprintf(output, "%02X", (unsigned char)*input);
-        output += 2;
-        input++;
+        sprintf(output, "%02X", (unsigned char)*input);		//Input stelle zu Hex convertieren und in Output stelle schreiben
+        output += 2;		//Pointer auf Output position um 2 inkrementieren
+        input++;		//Pointer auf input Stringposition inkrementieren
     }
-    *output = '\0';
+    *output = '\0';		//Output string mit '\0' abschließen
+}
+
+void processLoraMessage(char *rxBuffer)
+{
+
+    printf("Empfangene Nachricht: %s\n", rxBuffer);
+
+	switch(stateAnswer)
+	{
+	case 0:
+		break;
+	case JOIN_ANSWER:
+		if(checkResponse(rxBuffer, "+EVT:JOIN FAILED") == 1)	//Puffer auf string überprüfen
+		{
+			state = JOIN;		//Zustand auf JOIN setzen
+		}
+		else if(checkResponse(rxBuffer, "+EVT:JOINED") == 1)	//Puffer auf string überprüfen
+		{
+			state = SEND;	//Zustand auf SEND setzen
+
+		}
+		else
+		{
+			state = GPS;	//Zustand auf GPS setzen
+		}
+		break;
+	case SEND_ANSWER:
+		if(checkResponse(rxBuffer, "AT_BUSY_ERROR") == 1)	//Puffer auf string überprüfen
+		{
+			HAL_Delay(5000);
+			state = SEND;	//Zustand auf SEND setzen
+		}
+		else if(checkResponse(rxBuffer, "AT_NO_NETWORK_JOINED") == 1)	//Puffer auf string überprüfen
+		{
+			state = JOIN;	//Zustand auf JOIN setzen
+		}
+		else if(checkResponse(rxBuffer, "+EVT:SEND_CONFIRMED") == 1)	//Puffer auf string überprüfen
+		{
+			state = SLEEP;	//Zustand auf SLEEP setzen
+		}
+		else if(checkResponse(rxBuffer, "AT_PARAM_ERROR") == 1)	//Puffer auf string überprüfen
+		{
+			state = GPS;	//Zustand auf GPS setzen
+		}
+		else
+		{
+			state = SEND;	//Zustand auf SEND setzen
+		}
+		break;
+	}
+//	answerRecieved = 0;
+}
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim){		//Errortimout ISR
+	if(htim ->Instance == TIM5){	//Prüfen ob Timer5 Interrupt ausgelößt hat
+		state = FULL_RESET;		//State auf FULL_RESET setzten
+	}
 }
 
 /* USER CODE END 4 */
